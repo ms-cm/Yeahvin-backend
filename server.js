@@ -1,6 +1,7 @@
 // ============================================
 // YEAHVIN - Backend API Complete
 // E-commerce Geek - Produits Digitaux & Physiques
+// PDFs stockés sur Cloudinary (pas de stockage local)
 // ============================================
 
 const express = require('express');
@@ -22,13 +23,12 @@ require('dotenv').config();
 const app = express();
 
 // ============================================
-// DOSSIERS SÉCURISÉS
+// DOSSIERS TEMPORAIRES
 // ============================================
-const SECURE_PDFS_PATH = process.env.SECURE_PDFS_PATH || path.join(__dirname, '..', 'secure-pdfs');
 const WATERMARKED_PDFS_PATH = process.env.WATERMARKED_PDFS_PATH || path.join(__dirname, '..', 'watermarked');
 const TEMP_PATH = path.join(__dirname, '..', 'tmp');
 
-[SECURE_PDFS_PATH, WATERMARKED_PDFS_PATH, TEMP_PATH].forEach(dir => {
+[WATERMARKED_PDFS_PATH, TEMP_PATH].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         console.log('📁 Dossier créé :', dir);
@@ -213,18 +213,20 @@ const authenticateClient = async (req, res, next) => {
 // FONCTIONS UTILITAIRES
 // ============================================
 
-async function uploadToCloudinary(fileSource, folder = 'products', options = {}) {
+async function uploadToCloudinary(fileSource, folder = 'products', resourceType = 'image', options = {}) {
     return new Promise((resolve, reject) => {
         const uploadOptions = {
             folder: 'yeahvin/' + folder,
-            resource_type: 'image',
-            transformation: [
-                { width: options.width || 800, height: options.height || 800, crop: 'limit', quality: 'auto:good', fetch_format: 'auto' }
-            ],
+            resource_type: resourceType,
             use_filename: true,
             unique_filename: true,
             overwrite: false
         };
+        if (resourceType === 'image') {
+            uploadOptions.transformation = [
+                { width: options.width || 800, height: options.height || 800, crop: 'limit', quality: 'auto:good', fetch_format: 'auto' }
+            ];
+        }
         const uploadStream = cloudinary.uploader.upload_stream(uploadOptions, (error, result) => {
             if (error) reject(error);
             else resolve(result);
@@ -243,12 +245,12 @@ async function uploadToCloudinary(fileSource, folder = 'products', options = {})
     });
 }
 
-async function deleteFromCloudinary(publicIds) {
+async function deleteFromCloudinary(publicIds, resourceType = 'image') {
     const ids = Array.isArray(publicIds) ? publicIds : [publicIds];
     const results = await Promise.all(ids.map(async (publicId) => {
         if (!publicId || typeof publicId !== 'string') return { public_id: publicId, result: 'ignored' };
         try {
-            const result = await cloudinary.uploader.destroy(publicId, { resource_type: 'image', invalidate: true });
+            const result = await cloudinary.uploader.destroy(publicId, { resource_type: resourceType, invalidate: true });
             return { public_id: publicId, result: result.result };
         } catch (error) {
             return { public_id: publicId, result: 'error', error: error.message };
@@ -307,7 +309,7 @@ async function generateWatermarkedPdf(inputPath, outputPath, clientName, clientE
 // ROUTE PING (keep-alive Render)
 // ============================================
 app.get('/', (req, res) => {
-    res.status(200).json({ message: 'Yeahvin API is running', version: '2.0.0', timestamp: new Date().toISOString() });
+    res.status(200).json({ message: 'Yeahvin API is running', version: '3.0.0', timestamp: new Date().toISOString() });
 });
 
 // ============================================
@@ -479,7 +481,7 @@ app.post('/api/products', isAdmin, async (req, res) => {
             const files = Array.isArray(req.files.images) ? req.files.images : [req.files.images];
             for (const file of files) {
                 if (isValidImageType(file.mimetype)) {
-                    const result = await uploadToCloudinary(file.tempFilePath || file.data, 'products');
+                    const result = await uploadToCloudinary(file.tempFilePath || file.data, 'products', 'image');
                     imageUploads.push({ url: result.secure_url, public_id: result.public_id });
                 }
             }
@@ -520,7 +522,7 @@ app.put('/api/products/:id', isAdmin, async (req, res) => {
         if (deleteImages) {
             const toDelete = Array.isArray(deleteImages) ? deleteImages : JSON.parse(deleteImages);
             for (const publicId of toDelete) {
-                await deleteFromCloudinary(publicId);
+                await deleteFromCloudinary(publicId, 'image');
                 product.images = product.images.filter(img => img.public_id !== publicId);
             }
         }
@@ -528,7 +530,7 @@ app.put('/api/products/:id', isAdmin, async (req, res) => {
             const files = Array.isArray(req.files.images) ? req.files.images : [req.files.images];
             for (const file of files) {
                 if (isValidImageType(file.mimetype)) {
-                    const result = await uploadToCloudinary(file.tempFilePath || file.data, 'products');
+                    const result = await uploadToCloudinary(file.tempFilePath || file.data, 'products', 'image');
                     product.images.push({ url: result.secure_url, public_id: result.public_id });
                 }
             }
@@ -545,7 +547,7 @@ app.delete('/api/products/:id', isAdmin, async (req, res) => {
         const product = await Product.findById(req.params.id);
         if (!product) return res.status(404).json({ error: 'Produit non trouvé' });
         for (const img of product.images) {
-            await deleteFromCloudinary(img.public_id);
+            await deleteFromCloudinary(img.public_id, 'image');
         }
         await Product.findByIdAndDelete(req.params.id);
         res.json({ message: 'Produit supprimé' });
@@ -564,7 +566,7 @@ app.post('/api/upload', isAdmin, uploadLimiter, async (req, res) => {
         const imageFile = req.files.image;
         if (!isValidImageType(imageFile.mimetype)) return res.status(400).json({ error: 'Type de fichier non supporté' });
         const folder = req.body.folder || 'products';
-        const result = await uploadToCloudinary(imageFile.tempFilePath || imageFile.data, folder);
+        const result = await uploadToCloudinary(imageFile.tempFilePath || imageFile.data, folder, 'image');
         res.json({
             success: true,
             image: { url: result.secure_url, public_id: result.public_id, format: result.format, width: result.width, height: result.height, size: result.bytes }
@@ -581,21 +583,31 @@ app.post('/api/upload/pdf', isAdmin, async (req, res) => {
         if (pdfFile.mimetype !== 'application/pdf' && !pdfFile.name.endsWith('.pdf')) {
             return res.status(400).json({ error: 'Seuls les fichiers PDF sont acceptés' });
         }
-        const fileName = uuidv4() + '.pdf';
-        const filePath = path.join(SECURE_PDFS_PATH, fileName);
-        await pdfFile.mv(filePath);
+
+        const result = await uploadToCloudinary(
+            pdfFile.tempFilePath || pdfFile.data,
+            'pdfs',
+            'raw'
+        );
+
         res.json({
             success: true,
-            file: { url: fileName, originalName: pdfFile.name, size: pdfFile.size }
+            file: {
+                url: result.secure_url,
+                public_id: result.public_id,
+                originalName: pdfFile.name,
+                size: result.bytes
+            }
         });
     } catch (error) {
+        console.error('Erreur upload PDF:', error);
         res.status(500).json({ error: 'Erreur upload PDF' });
     }
 });
 
 app.delete('/api/upload/:public_id', isAdmin, async (req, res) => {
     try {
-        const result = await deleteFromCloudinary(req.params.public_id);
+        const result = await deleteFromCloudinary(req.params.public_id, 'image');
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: 'Erreur suppression' });
@@ -872,31 +884,40 @@ app.get('/api/download/:token', downloadLimiter, async (req, res) => {
 
         const user = await User.findById(downloadToken.userId);
         const product = await Product.findById(downloadToken.productId);
-        if (!user || !product || !product.fileUrl) return res.status(404).json({ error: 'Fichier non trouvé' });
+        if (!user || !product) return res.status(404).json({ error: 'Produit ou utilisateur non trouvé' });
 
-        const originalPdfPath = path.join(SECURE_PDFS_PATH, product.fileUrl);
-        if (!fs.existsSync(originalPdfPath)) return res.status(404).json({ error: 'Fichier source introuvable. Contactez le support.' });
+        const pdfUrl = product.fileUrl;
+        if (!pdfUrl) return res.status(404).json({ error: 'Fichier source introuvable. Contactez le support.' });
 
-        const watermarkedDir = path.join(WATERMARKED_PDFS_PATH, downloadToken.userId.toString());
-        if (!fs.existsSync(watermarkedDir)) fs.mkdirSync(watermarkedDir, { recursive: true });
-        const watermarkedPath = path.join(watermarkedDir, downloadToken.orderId + '_' + product._id + '_watermarked.pdf');
+        console.log('📥 Téléchargement du PDF depuis Cloudinary:', pdfUrl);
 
-        if (!fs.existsSync(watermarkedPath) && product.isWatermarkable) {
-            try {
-                await generateWatermarkedPdf(
-                    originalPdfPath,
-                    watermarkedPath,
-                    user.fullName,
-                    user.email,
-                    downloadToken.orderId,
-                    new Date().toLocaleDateString('fr-FR')
-                );
-            } catch (watermarkError) {
-                console.error('Erreur watermarking:', watermarkError);
-                downloadToken.downloadCount += 1;
-                await downloadToken.save();
-                return res.download(originalPdfPath, product.name.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf');
+        // Télécharger le PDF depuis Cloudinary
+        const response = await fetch(pdfUrl);
+        if (!response.ok) return res.status(404).json({ error: 'Fichier source introuvable. Contactez le support.' });
+        const arrayBuffer = await response.arrayBuffer();
+        const originalPdfBuffer = Buffer.from(arrayBuffer);
+
+        // Sauvegarder temporairement
+        const tempDir = path.join(TEMP_PATH, 'downloads');
+        if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+        const tempOriginalPath = path.join(tempDir, uuidv4() + '.pdf');
+        fs.writeFileSync(tempOriginalPath, originalPdfBuffer);
+
+        // Watermarker si nécessaire
+        let finalPath = tempOriginalPath;
+        if (product.isWatermarkable) {
+            const watermarkedDir = path.join(WATERMARKED_PDFS_PATH, downloadToken.userId.toString());
+            if (!fs.existsSync(watermarkedDir)) fs.mkdirSync(watermarkedDir, { recursive: true });
+            const watermarkedPath = path.join(watermarkedDir, downloadToken.orderId + '_' + product._id + '_watermarked.pdf');
+
+            if (!fs.existsSync(watermarkedPath)) {
+                try {
+                    await generateWatermarkedPdf(tempOriginalPath, watermarkedPath, user.fullName, user.email, downloadToken.orderId, new Date().toLocaleDateString('fr-FR'));
+                } catch (e) {
+                    console.error('Erreur watermarking:', e);
+                }
             }
+            if (fs.existsSync(watermarkedPath)) finalPath = watermarkedPath;
         }
 
         downloadToken.downloadCount += 1;
@@ -904,20 +925,14 @@ app.get('/api/download/:token', downloadLimiter, async (req, res) => {
 
         const purchase = await Purchase.findOne({ orderNumber: downloadToken.orderId });
         if (purchase) {
-            purchase.logs.push({
-                action: 'download',
-                productId: product._id,
-                productName: product.name,
-                timestamp: new Date(),
-                ip: req.ip,
-                userAgent: req.headers['user-agent']
-            });
+            purchase.logs.push({ action: 'download', productId: product._id, productName: product.name, timestamp: new Date(), ip: req.ip, userAgent: req.headers['user-agent'] });
             await purchase.save();
         }
 
-        const finalPath = (product.isWatermarkable && fs.existsSync(watermarkedPath)) ? watermarkedPath : originalPdfPath;
         const safeFileName = product.name.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf';
-        res.download(finalPath, safeFileName);
+        res.download(finalPath, safeFileName, function() {
+            if (fs.existsSync(tempOriginalPath)) fs.unlinkSync(tempOriginalPath);
+        });
     } catch (error) {
         console.error('Erreur téléchargement:', error);
         res.status(500).json({ error: 'Erreur lors du téléchargement' });
@@ -1150,9 +1165,7 @@ const startServer = async () => {
         app.listen(PORT, () => {
             console.log('🚀 Serveur démarré sur le port ' + PORT);
             console.log('🌍 Environnement: ' + (process.env.NODE_ENV || 'development'));
-            console.log('🔗 URL: http://localhost:' + PORT);
-            console.log('📦 PDFs: ' + SECURE_PDFS_PATH);
-            console.log('🔒 Watermarked: ' + WATERMARKED_PDFS_PATH);
+            console.log('☁️  PDFs stockés sur Cloudinary');
             console.log('✨ Prêt à recevoir des requêtes');
         });
     } catch (error) {
