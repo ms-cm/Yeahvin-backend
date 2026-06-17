@@ -713,6 +713,155 @@ app.post('/api/orders/create', authenticateClient, async (req, res) => {
     }
 });
 
+app.post('/api/orders/create-from-whatsapp', async (req, res) => {
+    try {
+        const { products, customerName, customerPhone, customerEmail, promoCode } = req.body;
+        if (!products || products.length === 0) return res.status(400).json({ error: 'Aucun produit' });
+        if (!customerName || !customerPhone) return res.status(400).json({ error: 'Nom et téléphone requis' });
+
+        let user = await User.findOne({ phone: customerPhone });
+        if (!user) {
+            user = new User({
+                fullName: customerName,
+                email: customerEmail || (customerPhone + '@yeahvin.local'),
+                password: await bcrypt.hash(customerPhone + Date.now(), 12),
+                phone: customerPhone,
+                authProvider: 'phone'
+            });
+            await user.save();
+        }
+
+        let totalAmount = 0;
+        const orderProducts = [];
+        for (const item of products) {
+            const product = await Product.findById(item.productId);
+            if (!product) return res.status(404).json({ error: 'Produit ' + item.productId + ' non trouvé' });
+            if (product.stock < (item.qty || 1)) return res.status(400).json({ error: 'Stock insuffisant pour ' + product.name });
+            totalAmount += product.price * (item.qty || 1);
+            orderProducts.push({
+                productId: product._id, productName: product.name, price: product.price,
+                qty: item.qty || 1, type: product.type || 'digital', downloadToken: null, watermarked: false
+            });
+        }
+
+        let discountAmount = 0;
+        if (promoCode) {
+            const promo = await PromoCode.findOne({ code: promoCode.toUpperCase(), active: true, expiresAt: { $gt: new Date() } });
+            if (promo) discountAmount = Math.round((totalAmount * promo.discount) / 100);
+        }
+
+        const finalTotal = totalAmount - discountAmount;
+        const orderNumber = 'YV-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+
+        const purchase = new Purchase({
+            userId: user._id,
+            products: orderProducts,
+            totalAmount: finalTotal,
+            discountAmount,
+            promoCode: promoCode || null,
+            status: 'pending',
+            orderNumber,
+            logs: [{ action: 'order_created', timestamp: new Date(), ip: req.ip, userAgent: req.headers['user-agent'] }]
+        });
+        await purchase.save();
+
+        for (const item of products) {
+            await Product.findByIdAndUpdate(item.productId, { $inc: { stock: -(item.qty || 1) } });
+        }
+
+        res.status(201).json({
+            message: 'Commande créée, en attente de validation',
+            order: { orderNumber: purchase.orderNumber, totalAmount: finalTotal, status: 'pending' }
+        });
+    } catch (error) {
+        console.error('Erreur commande WhatsApp:', error);
+        res.status(500).json({ error: 'Erreur création commande' });
+    }
+});
+
+app.get('/api/orders/:orderNumber/status', async (req, res) => {
+    try {
+        const purchase = await Purchase.findOne({ orderNumber: req.params.orderNumber }).lean();
+        if (!purchase) return res.status(404).json({ error: 'Commande non trouvée' });
+
+        const downloadLinks = [];
+        if (purchase.status === 'completed') {
+            for (const prod of purchase.products) {
+                if (prod.type === 'digital' && prod.downloadToken) {
+                    const token = await DownloadToken.findOne({ token: prod.downloadToken });
+                    if (token) {
+                        downloadLinks.push({
+                            productName: prod.productName,
+                            downloadUrl: '/api/download/' + prod.downloadToken,
+                            isExpired: new Date() > token.expiresAt,
+                            downloadsRemaining: token.maxDownloads - token.downloadCount
+                        });
+                    }
+                }
+            }
+        }
+
+        res.json({
+            orderNumber: purchase.orderNumber,
+            status: purchase.status,
+            totalAmount: purchase.totalAmount,
+            purchaseDate: purchase.purchaseDate,
+            downloadLinks: downloadLinks
+        });
+    } catch (error) {
+        console.error('Erreur statut commande:', error);
+        res.status(500).json({ error: 'Erreur vérification statut' });
+    }
+});
+
+app.put('/api/admin/orders/:orderNumber/approve', isAdmin, async (req, res) => {
+    try {
+        const purchase = await Purchase.findOne({ orderNumber: req.params.orderNumber });
+        if (!purchase) return res.status(404).json({ error: 'Commande non trouvée' });
+        if (purchase.status === 'completed') return res.status(400).json({ error: 'Commande déjà validée' });
+
+        const downloadLinks = [];
+        for (const prod of purchase.products) {
+            if (prod.type === 'digital') {
+                const token = uuidv4();
+                const downloadToken = new DownloadToken({
+                    token,
+                    userId: purchase.userId,
+                    productId: prod.productId,
+                    orderId: purchase.orderNumber,
+                    expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+                    maxDownloads: 5
+                });
+                await downloadToken.save();
+                prod.downloadToken = token;
+                downloadLinks.push({
+                    productName: prod.productName,
+                    downloadUrl: '/api/download/' + token,
+                    expiresAt: downloadToken.expiresAt
+                });
+            }
+        }
+
+        purchase.status = 'completed';
+        purchase.logs.push({
+            action: 'order_approved',
+            timestamp: new Date(),
+            ip: req.ip,
+            userAgent: req.headers['user-agent']
+        });
+        await purchase.save();
+
+        res.json({
+            message: 'Commande validée avec succès',
+            orderNumber: purchase.orderNumber,
+            downloadLinks: downloadLinks
+        });
+    } catch (error) {
+        console.error('Erreur validation commande:', error);
+        res.status(500).json({ error: 'Erreur validation commande' });
+    }
+});
+
 app.get('/api/download/:token', downloadLimiter, async (req, res) => {
     try {
         const { token } = req.params;
@@ -720,29 +869,58 @@ app.get('/api/download/:token', downloadLimiter, async (req, res) => {
         if (!downloadToken) return res.status(404).json({ error: 'Lien invalide' });
         if (new Date() > downloadToken.expiresAt) return res.status(410).json({ error: 'Lien expiré', canRegenerate: true });
         if (downloadToken.downloadCount >= downloadToken.maxDownloads) return res.status(429).json({ error: 'Limite de téléchargements atteinte', canRegenerate: false });
+
         const user = await User.findById(downloadToken.userId);
         const product = await Product.findById(downloadToken.productId);
         if (!user || !product || !product.fileUrl) return res.status(404).json({ error: 'Fichier non trouvé' });
+
         const originalPdfPath = path.join(SECURE_PDFS_PATH, product.fileUrl);
-        if (!fs.existsSync(originalPdfPath)) return res.status(404).json({ error: 'Fichier source introuvable' });
+        if (!fs.existsSync(originalPdfPath)) return res.status(404).json({ error: 'Fichier source introuvable. Contactez le support.' });
+
         const watermarkedDir = path.join(WATERMARKED_PDFS_PATH, downloadToken.userId.toString());
         if (!fs.existsSync(watermarkedDir)) fs.mkdirSync(watermarkedDir, { recursive: true });
         const watermarkedPath = path.join(watermarkedDir, downloadToken.orderId + '_' + product._id + '_watermarked.pdf');
+
         if (!fs.existsSync(watermarkedPath) && product.isWatermarkable) {
-            await generateWatermarkedPdf(originalPdfPath, watermarkedPath, user.fullName, user.email, downloadToken.orderId, new Date().toLocaleDateString('fr-FR'));
+            try {
+                await generateWatermarkedPdf(
+                    originalPdfPath,
+                    watermarkedPath,
+                    user.fullName,
+                    user.email,
+                    downloadToken.orderId,
+                    new Date().toLocaleDateString('fr-FR')
+                );
+            } catch (watermarkError) {
+                console.error('Erreur watermarking:', watermarkError);
+                downloadToken.downloadCount += 1;
+                await downloadToken.save();
+                return res.download(originalPdfPath, product.name.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf');
+            }
         }
+
         downloadToken.downloadCount += 1;
         await downloadToken.save();
+
         const purchase = await Purchase.findOne({ orderNumber: downloadToken.orderId });
         if (purchase) {
-            purchase.logs.push({ action: 'download', productId: product._id, productName: product.name, timestamp: new Date(), ip: req.ip, userAgent: req.headers['user-agent'] });
+            purchase.logs.push({
+                action: 'download',
+                productId: product._id,
+                productName: product.name,
+                timestamp: new Date(),
+                ip: req.ip,
+                userAgent: req.headers['user-agent']
+            });
             await purchase.save();
         }
+
         const finalPath = (product.isWatermarkable && fs.existsSync(watermarkedPath)) ? watermarkedPath : originalPdfPath;
-        res.download(finalPath, product.name.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf');
+        const safeFileName = product.name.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf';
+        res.download(finalPath, safeFileName);
     } catch (error) {
         console.error('Erreur téléchargement:', error);
-        res.status(500).json({ error: 'Erreur téléchargement' });
+        res.status(500).json({ error: 'Erreur lors du téléchargement' });
     }
 });
 
@@ -750,54 +928,97 @@ app.post('/api/download/regenerate', authenticateClient, async (req, res) => {
     try {
         const { orderId, productId } = req.body;
         const userId = req.user._id;
+
         const purchase = await Purchase.findOne({ orderNumber: orderId, userId, status: 'completed' });
         if (!purchase) return res.status(404).json({ error: 'Commande non trouvée' });
+
         const prod = purchase.products.find(p => p.productId.toString() === productId);
         if (!prod) return res.status(404).json({ error: 'Produit non trouvé dans cette commande' });
-        if (prod.type !== 'digital') return res.status(400).json({ error: 'Produit non digital' });
-        const regenerateCount = purchase.logs.filter(log => log.action === 'regenerate_link' && log.productId?.toString() === productId).length;
-        if (regenerateCount >= 3) return res.status(429).json({ error: 'Limite de régénérations atteinte' });
+        if (prod.type !== 'digital') return res.status(400).json({ error: 'Ce produit n\'est pas un produit digital' });
+
+        const regenerateCount = purchase.logs.filter(log =>
+            log.action === 'regenerate_link' && log.productId?.toString() === productId
+        ).length;
+
+        if (regenerateCount >= 3) {
+            return res.status(429).json({
+                error: 'Limite de régénérations atteinte',
+                message: 'Vous avez atteint la limite de régénération pour ce produit. Contactez le support.'
+            });
+        }
+
         const newToken = uuidv4();
         const downloadToken = new DownloadToken({
-            token: newToken, userId, productId, orderId,
-            expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000), maxDownloads: 5
+            token: newToken,
+            userId,
+            productId,
+            orderId,
+            expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+            maxDownloads: 5
         });
         await downloadToken.save();
+
         prod.downloadToken = newToken;
-        purchase.logs.push({ action: 'regenerate_link', productId, productName: prod.productName, timestamp: new Date(), ip: req.ip, userAgent: req.headers['user-agent'] });
+        purchase.logs.push({
+            action: 'regenerate_link',
+            productId,
+            productName: prod.productName,
+            timestamp: new Date(),
+            ip: req.ip,
+            userAgent: req.headers['user-agent']
+        });
         await purchase.save();
-        res.json({ message: 'Nouveau lien généré', downloadUrl: '/api/download/' + newToken, remainingRegenerations: 2 - regenerateCount });
+
+        res.json({
+            message: 'Nouveau lien généré avec succès',
+            downloadUrl: '/api/download/' + newToken,
+            expiresAt: downloadToken.expiresAt,
+            remainingRegenerations: 2 - regenerateCount
+        });
     } catch (error) {
-        res.status(500).json({ error: 'Erreur régénération' });
+        console.error('Erreur régénération:', error);
+        res.status(500).json({ error: 'Impossible de régénérer le lien' });
     }
 });
 
 app.get('/api/client/purchases', authenticateClient, async (req, res) => {
     try {
-        const purchases = await Purchase.find({ userId: req.user._id, status: 'completed' }).sort('-purchaseDate').lean();
-        const formatted = purchases.map(p => ({
-            orderNumber: p.orderNumber,
-            purchaseDate: p.purchaseDate,
-            totalAmount: p.totalAmount,
-            products: p.products.map(prod => ({
+        const purchases = await Purchase.find({
+            userId: req.user._id,
+            status: 'completed'
+        }).sort('-purchaseDate').lean();
+
+        const formatted = purchases.map(purchase => ({
+            orderNumber: purchase.orderNumber,
+            purchaseDate: purchase.purchaseDate,
+            totalAmount: purchase.totalAmount,
+            products: purchase.products.map(prod => ({
                 productId: prod.productId,
                 productName: prod.productName,
                 price: prod.price,
                 type: prod.type,
-                downloadToken: prod.downloadToken,
-                downloadUrl: prod.downloadToken ? '/api/download/' + prod.downloadToken : null
+                downloadToken: prod.downloadToken || null,
+                downloadUrl: prod.downloadToken ? '/api/download/' + prod.downloadToken : null,
+                isWatermarked: prod.watermarked || false
             }))
         }));
+
         res.json({ purchases: formatted });
     } catch (error) {
-        res.status(500).json({ error: 'Erreur récupération achats' });
+        console.error('Erreur récupération achats:', error);
+        res.status(500).json({ error: 'Impossible de récupérer vos achats' });
     }
 });
 
 app.get('/api/client/purchase/:orderNumber', authenticateClient, async (req, res) => {
     try {
-        const purchase = await Purchase.findOne({ orderNumber: req.params.orderNumber, userId: req.user._id }).lean();
+        const purchase = await Purchase.findOne({
+            orderNumber: req.params.orderNumber,
+            userId: req.user._id
+        }).lean();
+
         if (!purchase) return res.status(404).json({ error: 'Commande non trouvée' });
+
         const productsWithStatus = await Promise.all(purchase.products.map(async (prod) => {
             if (prod.type === 'digital' && prod.downloadToken) {
                 const token = await DownloadToken.findOne({ token: prod.downloadToken });
@@ -806,16 +1027,24 @@ app.get('/api/client/purchase/:orderNumber', authenticateClient, async (req, res
                     downloadStatus: {
                         isExpired: token ? new Date() > token.expiresAt : true,
                         downloadsRemaining: token ? token.maxDownloads - token.downloadCount : 0,
-                        expiresAt: token?.expiresAt,
+                        expiresAt: token?.expiresAt || null,
                         canRegenerate: token ? new Date() > token.expiresAt : true
                     }
                 };
             }
             return prod;
         }));
-        res.json({ ...purchase, products: productsWithStatus });
+
+        res.json({
+            orderNumber: purchase.orderNumber,
+            purchaseDate: purchase.purchaseDate,
+            totalAmount: purchase.totalAmount,
+            status: purchase.status,
+            products: productsWithStatus
+        });
     } catch (error) {
-        res.status(500).json({ error: 'Erreur détail commande' });
+        console.error('Erreur détail commande:', error);
+        res.status(500).json({ error: 'Impossible de récupérer la commande' });
     }
 });
 
@@ -825,7 +1054,15 @@ app.get('/api/client/purchase/:orderNumber', authenticateClient, async (req, res
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
-        const [totalProducts, totalClients, activePromos, featuredProducts, totalOrders, totalDigital, totalPhysique] = await Promise.all([
+        const [
+            totalProducts,
+            totalClients,
+            activePromos,
+            featuredProducts,
+            totalOrders,
+            totalDigital,
+            totalPhysique
+        ] = await Promise.all([
             Product.countDocuments(),
             User.countDocuments({ role: 'client' }),
             PromoCode.countDocuments({ active: true, expiresAt: { $gt: new Date() } }),
@@ -834,17 +1071,37 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             Product.countDocuments({ type: 'digital' }),
             Product.countDocuments({ type: 'physique' })
         ]);
-        res.json({ stats: { totalProducts, totalClients, activePromos, featuredProducts, totalOrders, totalDigital, totalPhysique } });
+
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const recentProducts = await Product.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
+
+        res.json({
+            stats: {
+                totalProducts,
+                totalClients,
+                activePromos,
+                featuredProducts,
+                totalOrders,
+                totalDigital,
+                totalPhysique,
+                recentProducts
+            }
+        });
     } catch (error) {
-        res.status(500).json({ error: 'Erreur stats' });
+        console.error('Erreur stats:', error);
+        res.status(500).json({ error: 'Erreur récupération statistiques' });
     }
 });
 
 app.get('/api/admin/orders', isAdmin, async (req, res) => {
     try {
-        const orders = await Purchase.find().sort('-purchaseDate').populate('userId', 'fullName email phone').lean();
+        const orders = await Purchase.find()
+            .sort('-purchaseDate')
+            .populate('userId', 'fullName email phone')
+            .lean();
         res.json({ orders });
     } catch (error) {
+        console.error('Erreur chargement commandes:', error);
         res.status(500).json({ error: 'Erreur chargement commandes' });
     }
 });
@@ -858,8 +1115,10 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    console.error('Erreur:', err);
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux (max 50MB)' });
+    console.error('Erreur non gérée:', err);
+    if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Fichier trop volumineux (max 50MB)' });
+    }
     res.status(500).json({ error: 'Erreur serveur interne' });
 });
 
@@ -875,29 +1134,60 @@ mongoose.set('strictQuery', false);
 const startServer = async () => {
     try {
         console.log('🔄 Connexion MongoDB...');
+        console.log('📍 URI: ' + MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@'));
+
         await mongoose.connect(MONGODB_URI, {
             serverSelectionTimeoutMS: 30000,
             socketTimeoutMS: 45000,
-            maxPoolSize: 10
+            connectTimeoutMS: 30000,
+            maxPoolSize: 10,
+            minPoolSize: 2
         });
-        console.log('✅ MongoDB connecté');
+
+        console.log('✅ Connecté à MongoDB');
+        console.log('📦 Base de données: ' + mongoose.connection.db.databaseName);
+
         app.listen(PORT, () => {
-            console.log('🚀 Yeahvin API sur http://localhost:' + PORT);
+            console.log('🚀 Serveur démarré sur le port ' + PORT);
+            console.log('🌍 Environnement: ' + (process.env.NODE_ENV || 'development'));
+            console.log('🔗 URL: http://localhost:' + PORT);
             console.log('📦 PDFs: ' + SECURE_PDFS_PATH);
             console.log('🔒 Watermarked: ' + WATERMARKED_PDFS_PATH);
+            console.log('✨ Prêt à recevoir des requêtes');
         });
     } catch (error) {
-        console.error('❌ Erreur connexion:', error.message);
-        console.log('🔄 Nouvelle tentative dans 5s...');
+        console.error('❌ Erreur de connexion MongoDB:', error.message);
+        console.log('🔄 Nouvelle tentative dans 5 secondes...');
         setTimeout(startServer, 5000);
     }
 };
 
+mongoose.connection.on('connected', () => {
+    console.log('📊 Mongoose connecté à MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+    console.error('❌ Erreur Mongoose:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+    console.log('🔌 Mongoose déconnecté de MongoDB');
+});
+
 process.on('SIGINT', async () => {
+    console.log('\n🛑 Arrêt du serveur...');
     await mongoose.connection.close();
-    console.log('🛑 Serveur arrêté');
+    console.log('📊 Connexion MongoDB fermée');
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
+    await mongoose.connection.close();
+    console.log('📊 Connexion MongoDB fermée');
     process.exit(0);
 });
 
 startServer();
+
 module.exports = app;
