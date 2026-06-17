@@ -1,7 +1,7 @@
 // ============================================
 // YEAHVIN - Backend API Complete
 // E-commerce Geek - Produits Digitaux & Physiques
-// PDFs stockés sur Cloudinary (pas de stockage local)
+// PDFs stockés sur Cloudinary - Watermark 50%
 // ============================================
 
 const express = require('express');
@@ -264,7 +264,7 @@ function isValidImageType(mimetype) {
 }
 
 async function generateWatermarkedPdf(inputPath, outputPath, clientName, clientEmail, orderId, purchaseDate) {
-    console.log('🔒 Watermark:', orderId, 'pour', clientName);
+    console.log('🔒 Watermark 50%:', orderId, 'pour', clientName);
     const existingPdfBytes = fs.readFileSync(inputPath);
     const pdfDoc = await PDFDocument.load(existingPdfBytes);
     const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
@@ -274,34 +274,42 @@ async function generateWatermarkedPdf(inputPath, outputPath, clientName, clientE
     for (const page of pages) {
         const { width, height } = page.getSize();
         const angle = Math.atan2(height, width) * (180 / Math.PI);
-        const fontSize = Math.max(10, Math.floor(Math.sqrt(width * width + height * height) * 0.025));
+        const fontSize = Math.max(14, Math.floor(Math.sqrt(width * width + height * height) * 0.03));
+        
+        // Watermark principal en diagonale - 50% visible
         page.drawText(watermarkText, {
             x: width / 2 - (watermarkText.length * fontSize * 0.22),
             y: height / 2,
             size: fontSize,
             font: helveticaFont,
-            color: rgb(0.8, 0.8, 0.8),
-            opacity: 0.12,
+            color: rgb(0.2, 0.2, 0.2),
+            opacity: 0.50,
             rotate: { type: 0, angle: angle }
         });
+        
+        // Ligne du bas - 50%
         page.drawText('Yeahvin - ' + orderId, {
-            x: width - 160, y: 25,
-            size: Math.floor(fontSize * 0.55),
+            x: width - 200,
+            y: 30,
+            size: Math.floor(fontSize * 0.6),
             font: helveticaFont,
-            color: rgb(0.7, 0.7, 0.7),
-            opacity: 0.08
+            color: rgb(0.2, 0.2, 0.2),
+            opacity: 0.50
         });
+        
+        // Email en haut - 50%
         page.drawText(clientEmail, {
-            x: 30, y: height - 15,
-            size: Math.floor(fontSize * 0.45),
+            x: 40,
+            y: height - 20,
+            size: Math.floor(fontSize * 0.5),
             font: helveticaFont,
-            color: rgb(0.7, 0.7, 0.7),
-            opacity: 0.06
+            color: rgb(0.2, 0.2, 0.2),
+            opacity: 0.50
         });
     }
     const pdfBytes = await pdfDoc.save();
     fs.writeFileSync(outputPath, pdfBytes);
-    console.log('✅ PDF watermarké:', path.basename(outputPath));
+    console.log('✅ PDF watermarké 50%:', path.basename(outputPath));
     return outputPath;
 }
 
@@ -309,7 +317,7 @@ async function generateWatermarkedPdf(inputPath, outputPath, clientName, clientE
 // ROUTE PING (keep-alive Render)
 // ============================================
 app.get('/', (req, res) => {
-    res.status(200).json({ message: 'Yeahvin API is running', version: '3.0.0', timestamp: new Date().toISOString() });
+    res.status(200).json({ message: 'Yeahvin API is running', version: '3.1.0', timestamp: new Date().toISOString() });
 });
 
 // ============================================
@@ -1165,7 +1173,7 @@ const startServer = async () => {
         app.listen(PORT, () => {
             console.log('🚀 Serveur démarré sur le port ' + PORT);
             console.log('🌍 Environnement: ' + (process.env.NODE_ENV || 'development'));
-            console.log('☁️  PDFs stockés sur Cloudinary');
+            console.log('🔒 Watermark: 50% visible');
             console.log('✨ Prêt à recevoir des requêtes');
         });
     } catch (error) {
